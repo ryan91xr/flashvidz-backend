@@ -3,35 +3,39 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-// ✅ yt-dlp wrapper
 const youtubedl = require("yt-dlp-exec");
 
 const app = express();
 
-// ✅ MIDDLEWARE (FIXED)
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // ⭐ VERY IMPORTANT
+app.use(express.urlencoded({ extended: true }));
+
+// ✅ Prevent overload
+let isProcessing = false;
 
 app.post("/download", async (req, res) => {
+
+  if (isProcessing) {
+    return res.status(429).json({
+      success: false,
+      error: "Server busy, try again"
+    });
+  }
+
+  isProcessing = true;
+
   const url = req.body.url;
 
   if (!url) {
+    isProcessing = false;
     return res.status(400).json({ 
       success: false,
       error: "No URL provided" 
     });
   }
 
-  // 🔍 Detect platform
-  let platform = "unknown";
-  if (url.includes("tiktok")) platform = "tiktok";
-  else if (url.includes("instagram")) platform = "instagram";
-  else if (url.includes("youtube") || url.includes("youtu.be")) platform = "youtube";
-
-  console.log("\n📥 Incoming request");
-  console.log("URL:", url);
-  console.log("Platform:", platform);
+  console.log("\n📥 Request:", url);
 
   const fileName = `video_${Date.now()}.mp4`;
   const filePath = path.join(__dirname, fileName);
@@ -41,9 +45,10 @@ app.post("/download", async (req, res) => {
 
     await youtubedl(url, {
       output: filePath,
-      format: "best",
+      format: "bv*+ba/best", // 🔥 better format
       noPlaylist: true,
       socketTimeout: 15,
+      retries: 3,
       addHeader: [
         "user-agent: Mozilla/5.0",
         "accept-language: en-US,en;q=0.9"
@@ -52,39 +57,35 @@ app.post("/download", async (req, res) => {
 
     console.log("✅ Download completed");
 
-    // ✅ Ensure file exists
     if (!fs.existsSync(filePath)) {
-      console.log("❌ File not found after download");
+      isProcessing = false;
       return res.status(500).json({
         success: false,
         error: "File not created"
       });
     }
 
-    // ✅ Send file
     res.download(filePath, fileName, (err) => {
+
+      isProcessing = false;
+
       if (err) {
         console.log("❌ Send error:", err.message);
       }
 
-      // 🧹 Cleanup
       try {
         fs.unlinkSync(filePath);
-        console.log("🧹 File deleted");
-      } catch (e) {
-        console.log("Cleanup error:", e.message);
-      }
+      } catch {}
     });
 
   } catch (err) {
-    console.log("❌ yt-dlp failed:");
-    console.log(err.message);
+    isProcessing = false;
+
+    console.log("❌ Error:", err.message);
 
     return res.status(500).json({
       success: false,
-      platform,
-      error: "Download failed",
-      details: err.message
+      error: "Download failed"
     });
   }
 });
