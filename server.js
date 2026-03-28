@@ -3,13 +3,15 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-// ✅ IMPORTANT (you were missing this sometimes)
+// ✅ yt-dlp wrapper
 const youtubedl = require("yt-dlp-exec");
 
 const app = express();
 
+// ✅ MIDDLEWARE (FIXED)
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // ⭐ VERY IMPORTANT
 
 app.post("/download", async (req, res) => {
   const url = req.body.url;
