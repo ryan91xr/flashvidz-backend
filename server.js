@@ -1,81 +1,90 @@
 const express = require("express");
 const cors = require("cors");
-const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+// ✅ yt-dlp wrapper
+const youtubedl = require("yt-dlp-exec");
 
 const app = express();
 
-// ✅ MIDDLEWARE
+// ✅ MIDDLEWARE (FIXED)
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true })); // ⭐ VERY IMPORTANT
 
 app.post("/download", async (req, res) => {
   const url = req.body.url;
 
   if (!url) {
-    return res.status(400).json({
+    return res.status(400).json({ 
       success: false,
-      error: "No URL provided"
+      error: "No URL provided" 
     });
   }
 
-  console.log("\n📥 Streaming request");
+  // 🔍 Detect platform
+  let platform = "unknown";
+  if (url.includes("tiktok")) platform = "tiktok";
+  else if (url.includes("instagram")) platform = "instagram";
+  else if (url.includes("youtube") || url.includes("youtu.be")) platform = "youtube";
+
+  console.log("\n📥 Incoming request");
   console.log("URL:", url);
+  console.log("Platform:", platform);
+
+  const fileName = `video_${Date.now()}.mp4`;
+  const filePath = path.join(__dirname, fileName);
 
   try {
-    res.setHeader("Content-Disposition", "attachment; filename=flashvidz.mp4");
-    res.setHeader("Content-Type", "video/mp4");
+    console.log("⚙️ Running yt-dlp...");
 
-    console.log("⚡ Starting yt-dlp stream...");
-
-    const yt = spawn("npx", [
-      "yt-dlp-exec",
-      "-f", "bv*+ba/best",
-      "--no-playlist",
-      "--merge-output-format", "mp4",
-      "-o", "-",
-      url
-    ]);
-
-    yt.stdout.pipe(res);
-
-    yt.stderr.on("data", (data) => {
-      console.log("yt-dlp:", data.toString());
+    await youtubedl(url, {
+      output: filePath,
+      format: "best",
+      noPlaylist: true,
+      socketTimeout: 15,
+      addHeader: [
+        "user-agent: Mozilla/5.0",
+        "accept-language: en-US,en;q=0.9"
+      ]
     });
 
-    yt.on("close", (code) => {
-      console.log("✅ Stream finished:", code);
+    console.log("✅ Download completed");
 
-      if (!res.headersSent) {
-        res.status(500).end("Download failed");
-      } else {
-        res.end();
+    // ✅ Ensure file exists
+    if (!fs.existsSync(filePath)) {
+      console.log("❌ File not found after download");
+      return res.status(500).json({
+        success: false,
+        error: "File not created"
+      });
+    }
+
+    // ✅ Send file
+    res.download(filePath, fileName, (err) => {
+      if (err) {
+        console.log("❌ Send error:", err.message);
       }
-    });
 
-    yt.on("error", (err) => {
-      console.log("❌ Spawn error:", err.message);
-
-      if (!res.headersSent) {
-        res.status(500).json({
-          success: false,
-          error: "Streaming failed"
-        });
+      // 🧹 Cleanup
+      try {
+        fs.unlinkSync(filePath);
+        console.log("🧹 File deleted");
+      } catch (e) {
+        console.log("Cleanup error:", e.message);
       }
-    });
-
-    // ✅ Kill process if user leaves
-    req.on("close", () => {
-      console.log("⚠️ Client disconnected");
-      yt.kill("SIGKILL");
     });
 
   } catch (err) {
-    console.log("❌ Server error:", err.message);
+    console.log("❌ yt-dlp failed:");
+    console.log(err.message);
 
     return res.status(500).json({
       success: false,
-      error: "Streaming failed"
+      platform,
+      error: "Download failed",
+      details: err.message
     });
   }
 });
