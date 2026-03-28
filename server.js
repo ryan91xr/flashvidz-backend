@@ -31,7 +31,7 @@ app.post("/download", async (req, res) => {
   const url = req.body.url;
 
   if (!url) {
-    isProcessing = false; // 🔥 reset
+    isProcessing = false;
     return res.status(400).json({ 
       success: false,
       error: "No URL provided" 
@@ -54,25 +54,33 @@ app.post("/download", async (req, res) => {
   try {
     console.log("⚙️ Running yt-dlp...");
 
+    // ✅ 🔥 UPDATED PLAN B CONFIG
     await youtubedl(url, {
       output: filePath,
-      format: "bestvideo+bestaudio/best",
+
+      format: "bv*+ba/best",
+
       noPlaylist: true,
+
       socketTimeout: 30,
+      retries: 5,
+      fragmentRetries: 5,
+      forceIpv4: true,
+
       addHeader: [
-        "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "user-agent: Mozilla/5.0 (Linux; Android 10; Mobile)",
         "accept-language: en-US,en;q=0.9",
-        "referer: https://www.instagram.com/"
+        "referer: https://www.instagram.com/",
+        "origin: https://www.instagram.com"
       ],
-      retries: 3,
-      fragmentRetries: 3,
-      forceIpv4: true
+
+      extractorArgs: "instagram:api=mobile"
     });
 
     console.log("✅ Download completed");
 
     if (!fs.existsSync(filePath)) {
-      isProcessing = false; // 🔥 reset
+      isProcessing = false;
       console.log("❌ File not found after download");
       return res.status(500).json({
         success: false,
@@ -82,7 +90,7 @@ app.post("/download", async (req, res) => {
 
     res.download(filePath, fileName, (err) => {
 
-      isProcessing = false; // 🔥 reset ALWAYS after response
+      isProcessing = false;
 
       if (err) {
         console.log("❌ Send error:", err.message);
@@ -97,7 +105,7 @@ app.post("/download", async (req, res) => {
     });
 
   } catch (err) {
-    isProcessing = false; // 🔥 reset on error
+    isProcessing = false;
 
     console.log("❌ yt-dlp failed:");
     console.log(err.message);
