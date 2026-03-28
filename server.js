@@ -8,10 +8,10 @@ const youtubedl = require("yt-dlp-exec");
 
 const app = express();
 
-// ✅ MIDDLEWARE (FIXED)
+// ✅ MIDDLEWARE
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // ⭐ VERY IMPORTANT
+app.use(express.urlencoded({ extended: true }));
 
 app.post("/download", async (req, res) => {
   const url = req.body.url;
@@ -39,15 +39,22 @@ app.post("/download", async (req, res) => {
   try {
     console.log("⚙️ Running yt-dlp...");
 
+    // ✅ UPDATED (Instagram FIX)
     await youtubedl(url, {
       output: filePath,
-      format: "best",
+      format: "bestvideo+bestaudio/best",
       noPlaylist: true,
-      socketTimeout: 15,
+      socketTimeout: 30,
+
       addHeader: [
-        "user-agent: Mozilla/5.0",
-        "accept-language: en-US,en;q=0.9"
-      ]
+        "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "accept-language: en-US,en;q=0.9",
+        "referer: https://www.instagram.com/"
+      ],
+
+      retries: 3,
+      fragmentRetries: 3,
+      forceIpv4: true
     });
 
     console.log("✅ Download completed");
