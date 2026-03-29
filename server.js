@@ -14,6 +14,7 @@ const statAsync = promisify(fs.stat);
 const CONFIG = {
   MAX_FILE_SIZE: 500 * 1024 * 1024,
   DOWNLOAD_TIMEOUT: 120000,
+  CLEANUP_INTERVAL: 60000,
   MAX_CONCURRENT_DOWNLOADS: 3,
   ALLOWED_PLATFORMS: [
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
@@ -30,6 +31,36 @@ const tempFiles = new Set();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Rate limit
+const requestCounts = new Map();
+app.use((req, res, next) => {
+  const ip = req.ip;
+  const now = Date.now();
+  const windowStart = now - 15 * 60 * 1000;
+
+  const requests = requestCounts.get(ip) || [];
+  const recent = requests.filter(t => t > windowStart);
+
+  if (recent.length >= 10) {
+    return res.status(429).json({ success: false, error: "Too many requests" });
+  }
+
+  recent.push(now);
+  requestCounts.set(ip, recent);
+  next();
+});
+
+// Concurrent limiter
+const downloadLimiter = (req, res, next) => {
+  if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
+    return res.status(503).json({
+      success: false,
+      error: "Server busy, try again later"
+    });
+  }
+  next();
+};
 
 // ==================== VALIDATION ====================
 function validateUrl(url) {
@@ -57,18 +88,22 @@ function validateUrl(url) {
 async function cleanupFile(filePath) {
   if (!filePath) return;
   tempFiles.delete(filePath);
-  try { await unlinkAsync(filePath); } catch {}
+  try {
+    await unlinkAsync(filePath);
+  } catch {}
 }
 
-// ==================== CORE DOWNLOAD HANDLER ====================
-async function handleDownload(req, res, url) {
-  const validation = validateUrl(url);
-  if (!validation.valid) {
-    return res.status(400).send(validation.error);
+// ==================== DOWNLOAD ====================
+app.post("/download", downloadLimiter, async (req, res) => {
+  const url = req.body?.url?.trim();
+
+  if (!url) {
+    return res.status(400).json({ success: false, error: "No URL provided" });
   }
 
-  if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).send("Server busy");
+  const validation = validateUrl(url);
+  if (!validation.valid) {
+    return res.status(400).json({ success: false, error: validation.error });
   }
 
   const { platform } = validation;
@@ -80,89 +115,95 @@ async function handleDownload(req, res, url) {
   tempFiles.add(filePath);
 
   activeDownloads++;
-  let processRef;
-  let finished = false;
+  let downloadCompleted = false;
 
-  const timeout = setTimeout(async () => {
-    if (!finished) {
-      console.log("⏱️ Timeout killing process");
-      if (processRef) processRef.kill("SIGKILL");
+  let processRef;
+
+  const timeoutId = setTimeout(async () => {
+    if (!downloadCompleted) {
+      console.log("⏱️ Timeout - killing process");
+      if (processRef) processRef.kill("SIGKILL"); // 🔥 FIX
       await cleanupFile(filePath);
       activeDownloads--;
-      if (!res.headersSent) res.status(504).end("Timeout");
+      if (!res.headersSent) {
+        res.status(504).json({ success: false, error: "Download timeout" });
+      }
     }
   }, CONFIG.DOWNLOAD_TIMEOUT);
 
   try {
-    // 🔥 FAST + RELIABLE OPTIONS
+    // ✅ FIXED yt-dlp OPTIONS
     processRef = youtubedl.exec(url, {
       output: filePath,
-      format: "best",
+      format: "best[filesize<500M]/best",
       noPlaylist: true,
-      retries: 2,
-      fragmentRetries: 2,
+      retries: 3,
+      fragmentRetries: 3,
       addHeader: [
         "User-Agent: Mozilla/5.0",
         "Accept-Language: en-US,en;q=0.9"
       ],
+      preferFreeFormats: true,
       forceIpv4: true
     });
 
     await processRef;
 
-    clearTimeout(timeout);
-    finished = true;
+    clearTimeout(timeoutId);
+    downloadCompleted = true;
 
-    if (!fs.existsSync(filePath)) throw new Error("No file");
+    if (!fs.existsSync(filePath)) {
+      throw new Error("File not created");
+    }
 
     const stats = await statAsync(filePath);
 
-    // 🔥 HEADERS FOR DIRECT DOWNLOAD
-    res.setHeader("Content-Type", "video/mp4");
+    if (stats.size > CONFIG.MAX_FILE_SIZE) {
+      await cleanupFile(filePath);
+      activeDownloads--;
+      return res.status(413).json({ success: false, error: "File too large" });
+    }
+
+    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
+
+    // ✅ expose headers for frontend progress
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length");
     res.setHeader("Content-Length", stats.size);
-    res.setHeader("Content-Disposition", `attachment; filename="flashvidz.mp4"`);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="video_${platform}.mp4"`);
 
     const stream = fs.createReadStream(filePath);
 
-    stream.on("close", async () => {
-      activeDownloads--;
+    stream.on("error", async () => {
+      activeDownloads--; // 🔥 FIX
       await cleanupFile(filePath);
-      console.log("✅ Done");
     });
 
-    stream.on("error", async () => {
-      activeDownloads--;
+    stream.on("close", async () => {
+      activeDownloads--; // 🔥 FIX
       await cleanupFile(filePath);
+      console.log("✅ Done");
     });
 
     stream.pipe(res);
 
   } catch (err) {
-    clearTimeout(timeout);
-    finished = true;
+    clearTimeout(timeoutId);
+    downloadCompleted = true;
     activeDownloads--;
 
     await cleanupFile(filePath);
 
-    console.log("❌", err.message);
-    if (!res.headersSent) res.status(500).end("Download failed");
+    console.error("❌", err.message);
+
+    if (res.headersSent) return;
+
+    res.status(500).json({
+      success: false,
+      platform,
+      error: "Download failed"
+    });
   }
-}
-
-// ==================== ROUTES ====================
-
-// 🔥 NEW: GET (for iframe auto download)
-app.get("/download", (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).send("No URL");
-  handleDownload(req, res, url);
-});
-
-// (Optional) keep POST for future use
-app.post("/download", (req, res) => {
-  const url = req.body.url;
-  if (!url) return res.status(400).json({ error: "No URL" });
-  handleDownload(req, res, url);
 });
 
 // ==================== START ====================
