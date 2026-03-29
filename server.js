@@ -14,7 +14,6 @@ const statAsync = promisify(fs.stat);
 const CONFIG = {
   MAX_FILE_SIZE: 500 * 1024 * 1024,
   DOWNLOAD_TIMEOUT: 120000,
-  CLEANUP_INTERVAL: 60000,
   MAX_CONCURRENT_DOWNLOADS: 3,
   ALLOWED_PLATFORMS: [
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
@@ -31,36 +30,6 @@ const tempFiles = new Set();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Rate limit
-const requestCounts = new Map();
-app.use((req, res, next) => {
-  const ip = req.ip;
-  const now = Date.now();
-  const windowStart = now - 15 * 60 * 1000;
-
-  const requests = requestCounts.get(ip) || [];
-  const recent = requests.filter(t => t > windowStart);
-
-  if (recent.length >= 10) {
-    return res.status(429).json({ success: false, error: "Too many requests" });
-  }
-
-  recent.push(now);
-  requestCounts.set(ip, recent);
-  next();
-});
-
-// Concurrent limiter
-const downloadLimiter = (req, res, next) => {
-  if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).json({
-      success: false,
-      error: "Server busy, try again later"
-    });
-  }
-  next();
-};
 
 // ==================== VALIDATION ====================
 function validateUrl(url) {
@@ -88,22 +57,18 @@ function validateUrl(url) {
 async function cleanupFile(filePath) {
   if (!filePath) return;
   tempFiles.delete(filePath);
-  try {
-    await unlinkAsync(filePath);
-  } catch {}
+  try { await unlinkAsync(filePath); } catch {}
 }
 
-// ==================== DOWNLOAD ====================
-app.post("/download", downloadLimiter, async (req, res) => {
-  const url = req.body?.url?.trim();
-
-  if (!url) {
-    return res.status(400).json({ success: false, error: "No URL provided" });
-  }
-
+// ==================== CORE DOWNLOAD HANDLER ====================
+async function handleDownload(req, res, url) {
   const validation = validateUrl(url);
   if (!validation.valid) {
-    return res.status(400).json({ success: false, error: validation.error });
+    return res.status(400).send(validation.error);
+  }
+
+  if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
+    return res.status(503).send("Server busy");
   }
 
   const { platform } = validation;
@@ -115,95 +80,89 @@ app.post("/download", downloadLimiter, async (req, res) => {
   tempFiles.add(filePath);
 
   activeDownloads++;
-  let downloadCompleted = false;
-
   let processRef;
+  let finished = false;
 
-  const timeoutId = setTimeout(async () => {
-    if (!downloadCompleted) {
-      console.log("⏱️ Timeout - killing process");
-      if (processRef) processRef.kill("SIGKILL"); // 🔥 FIX
+  const timeout = setTimeout(async () => {
+    if (!finished) {
+      console.log("⏱️ Timeout killing process");
+      if (processRef) processRef.kill("SIGKILL");
       await cleanupFile(filePath);
       activeDownloads--;
-      if (!res.headersSent) {
-        res.status(504).json({ success: false, error: "Download timeout" });
-      }
+      if (!res.headersSent) res.status(504).end("Timeout");
     }
   }, CONFIG.DOWNLOAD_TIMEOUT);
 
   try {
-    // ✅ FIXED yt-dlp OPTIONS
+    // 🔥 FAST + RELIABLE OPTIONS
     processRef = youtubedl.exec(url, {
       output: filePath,
-      format: "best[filesize<500M]/best",
+      format: "best",
       noPlaylist: true,
-      retries: 3,
-      fragmentRetries: 3,
+      retries: 2,
+      fragmentRetries: 2,
       addHeader: [
         "User-Agent: Mozilla/5.0",
         "Accept-Language: en-US,en;q=0.9"
       ],
-      preferFreeFormats: true,
       forceIpv4: true
     });
 
     await processRef;
 
-    clearTimeout(timeoutId);
-    downloadCompleted = true;
+    clearTimeout(timeout);
+    finished = true;
 
-    if (!fs.existsSync(filePath)) {
-      throw new Error("File not created");
-    }
+    if (!fs.existsSync(filePath)) throw new Error("No file");
 
     const stats = await statAsync(filePath);
 
-    if (stats.size > CONFIG.MAX_FILE_SIZE) {
-      await cleanupFile(filePath);
-      activeDownloads--;
-      return res.status(413).json({ success: false, error: "File too large" });
-    }
-
-    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
-
-    // ✅ expose headers for frontend progress
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length");
-    res.setHeader("Content-Length", stats.size);
+    // 🔥 HEADERS FOR DIRECT DOWNLOAD
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="video_${platform}.mp4"`);
+    res.setHeader("Content-Length", stats.size);
+    res.setHeader("Content-Disposition", `attachment; filename="flashvidz.mp4"`);
 
     const stream = fs.createReadStream(filePath);
 
-    stream.on("error", async () => {
-      activeDownloads--; // 🔥 FIX
-      await cleanupFile(filePath);
-    });
-
     stream.on("close", async () => {
-      activeDownloads--; // 🔥 FIX
+      activeDownloads--;
       await cleanupFile(filePath);
       console.log("✅ Done");
+    });
+
+    stream.on("error", async () => {
+      activeDownloads--;
+      await cleanupFile(filePath);
     });
 
     stream.pipe(res);
 
   } catch (err) {
-    clearTimeout(timeoutId);
-    downloadCompleted = true;
+    clearTimeout(timeout);
+    finished = true;
     activeDownloads--;
 
     await cleanupFile(filePath);
 
-    console.error("❌", err.message);
-
-    if (res.headersSent) return;
-
-    res.status(500).json({
-      success: false,
-      platform,
-      error: "Download failed"
-    });
+    console.log("❌", err.message);
+    if (!res.headersSent) res.status(500).end("Download failed");
   }
+}
+
+// ==================== ROUTES ====================
+
+// 🔥 NEW: GET (for iframe auto download)
+app.get("/download", (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("No URL");
+  handleDownload(req, res, url);
+});
+
+// (Optional) keep POST for future use
+app.post("/download", (req, res) => {
+  const url = req.body.url;
+  if (!url) return res.status(400).json({ error: "No URL" });
+  handleDownload(req, res, url);
 });
 
 // ==================== START ====================
@@ -211,4 +170,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-      
