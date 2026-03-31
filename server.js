@@ -19,7 +19,8 @@ const CONFIG = {
   ALLOWED_PLATFORMS: [
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
     { name: "tiktok", domains: ["tiktok.com"] },
-    { name: "instagram", domains: ["instagram.com"] }
+    { name: "instagram", domains: ["instagram.com"] },
+    { name: "facebook", domains: ["facebook.com", "fb.watch"] } // ✅ Added Facebook
   ],
   // Path to your cookies.txt file
   COOKIES_PATH: path.join(__dirname, "cookies.txt")
@@ -154,13 +155,18 @@ app.post("/download", downloadLimiter, async (req, res) => {
       forceIpv4: true
     };
 
-    // ✅ ADD COOKIES for Instagram (and others if available)
-    if (platform === "instagram" && hasCookies()) {
+    // ✅ ADD COOKIES for Instagram, Facebook, and others if available
+    if ((platform === "instagram" || platform === "facebook") && hasCookies()) {
       options.cookies = CONFIG.COOKIES_PATH;
-      console.log("🍪 Using cookies for Instagram");
+      console.log(`🍪 Using cookies for ${platform}`);
     } else if (hasCookies()) {
       // Optional: use cookies for all platforms
       options.cookies = CONFIG.COOKIES_PATH;
+    }
+
+    // Facebook-specific: warn if no cookies
+    if (platform === "facebook" && !hasCookies()) {
+      console.log("⚠️ No cookies - public Facebook videos only");
     }
 
     processRef = youtubedl.exec(url, options);
@@ -214,7 +220,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
     console.error("❌", err.message);
 
     // Check if it's an authentication error
-    if (err.message?.includes("login") || err.message?.includes("cookie")) {
+    if (err.message?.includes("login") || err.message?.includes("cookie") || err.message?.includes("private")) {
       console.log("💡 Tip: Update your cookies.txt file");
     }
 
