@@ -10,3 +10,18 @@
 .instagram.com	TRUE	/	TRUE	1782708547	ds_user_id	39515033407
 .instagram.com	TRUE	/	TRUE	1806468522	sessionid	39515033407%3AHUc6NGntKu8f7G%3A18%3AAYhS0mhN9eF4939Im9bWpMn0x3LIszrK5mgtdJNhjw
 .instagram.com	TRUE	/	TRUE	0	rur	"CLN\05439515033407\0541806468642:01fe0a2a5fec9a1d49517053e249b11e63ac61699d02758b1d4e7739f9025479bf1ff4c3"
+
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.facebook.com	TRUE	/	TRUE	1809503263	datr	HnzLaa51lXfvgfsQBRp6ylRW
+.facebook.com	TRUE	/	TRUE	1809504184	sb	HnzLaSvbDVz5NNzqP87JLJzP
+.facebook.com	TRUE	/	TRUE	1775548991	wd	1366x641
+.facebook.com	TRUE	/	TRUE	1809503664	ps_l	1
+.facebook.com	TRUE	/	TRUE	1809503664	ps_n	1
+.facebook.com	TRUE	/	TRUE	1806480188	c_user	61551805570663
+.facebook.com	TRUE	/	TRUE	1782720188	fr	1XfKwIRinuas7sWic.AWfNmyb712ClL-qv29RVVqDyeMd89gWp1fVr4tfUbuahFyggxYw.Bpy3-7..AAA.0.0.Bpy3-7.AWeKnXphiDRl_G-Onv-OFVTegLc
+.facebook.com	TRUE	/	TRUE	1806480188	xs	29%3AvYqR8jjzF5skww%3A2%3A1774944181%3A-1%3A-1%3A%3AAczBuEEl2Rxz2Bepy2dhGYbtTf34odxgFfLOt3-02A
+.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1774944192499%2C%22v%22%3A1%7D
+
