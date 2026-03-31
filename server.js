@@ -20,7 +20,9 @@ const CONFIG = {
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
     { name: "tiktok", domains: ["tiktok.com"] },
     { name: "instagram", domains: ["instagram.com"] }
-  ]
+  ],
+  // Path to your cookies.txt file
+  COOKIES_PATH: path.join(__dirname, "cookies.txt")
 };
 
 // ==================== STATE ====================
@@ -93,6 +95,11 @@ async function cleanupFile(filePath) {
   } catch {}
 }
 
+// ==================== COOKIES CHECK ====================
+function hasCookies() {
+  return fs.existsSync(CONFIG.COOKIES_PATH);
+}
+
 // ==================== DOWNLOAD ====================
 app.post("/download", downloadLimiter, async (req, res) => {
   const url = req.body?.url?.trim();
@@ -122,7 +129,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
   const timeoutId = setTimeout(async () => {
     if (!downloadCompleted) {
       console.log("⏱️ Timeout - killing process");
-      if (processRef) processRef.kill("SIGKILL"); // 🔥 FIX
+      if (processRef) processRef.kill("SIGKILL");
       await cleanupFile(filePath);
       activeDownloads--;
       if (!res.headersSent) {
@@ -132,20 +139,31 @@ app.post("/download", downloadLimiter, async (req, res) => {
   }, CONFIG.DOWNLOAD_TIMEOUT);
 
   try {
-    // ✅ FIXED yt-dlp OPTIONS
-    processRef = youtubedl.exec(url, {
+    // Build yt-dlp options
+    const options = {
       output: filePath,
       format: "best[filesize<500M]/best",
       noPlaylist: true,
       retries: 3,
       fragmentRetries: 3,
       addHeader: [
-        "User-Agent: Mozilla/5.0",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language: en-US,en;q=0.9"
       ],
       preferFreeFormats: true,
       forceIpv4: true
-    });
+    };
+
+    // ✅ ADD COOKIES for Instagram (and others if available)
+    if (platform === "instagram" && hasCookies()) {
+      options.cookies = CONFIG.COOKIES_PATH;
+      console.log("🍪 Using cookies for Instagram");
+    } else if (hasCookies()) {
+      // Optional: use cookies for all platforms
+      options.cookies = CONFIG.COOKIES_PATH;
+    }
+
+    processRef = youtubedl.exec(url, options);
 
     await processRef;
 
@@ -166,7 +184,6 @@ app.post("/download", downloadLimiter, async (req, res) => {
 
     console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
-    // ✅ expose headers for frontend progress
     res.setHeader("Access-Control-Expose-Headers", "Content-Length");
     res.setHeader("Content-Length", stats.size);
     res.setHeader("Content-Type", "video/mp4");
@@ -175,12 +192,12 @@ app.post("/download", downloadLimiter, async (req, res) => {
     const stream = fs.createReadStream(filePath);
 
     stream.on("error", async () => {
-      activeDownloads--; // 🔥 FIX
+      activeDownloads--;
       await cleanupFile(filePath);
     });
 
     stream.on("close", async () => {
-      activeDownloads--; // 🔥 FIX
+      activeDownloads--;
       await cleanupFile(filePath);
       console.log("✅ Done");
     });
@@ -196,18 +213,35 @@ app.post("/download", downloadLimiter, async (req, res) => {
 
     console.error("❌", err.message);
 
+    // Check if it's an authentication error
+    if (err.message?.includes("login") || err.message?.includes("cookie")) {
+      console.log("💡 Tip: Update your cookies.txt file");
+    }
+
     if (res.headersSent) return;
 
     res.status(500).json({
       success: false,
       platform,
-      error: "Download failed"
+      error: "Download failed",
+      details: err.message
     });
   }
+});
+
+// ==================== HEALTH CHECK ====================
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    cookies_configured: hasCookies(),
+    cookies_path: CONFIG.COOKIES_PATH,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ==================== START ====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🍪 Cookies: ${hasCookies() ? "✅ Found" : "❌ Not found"} at ${CONFIG.COOKIES_PATH}`);
 });
