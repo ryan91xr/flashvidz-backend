@@ -12,17 +12,17 @@ const statAsync = promisify(fs.stat);
 
 // ==================== CONFIG ====================
 const CONFIG = {
-  MAX_FILE_SIZE: 500 * 1024 * 1024, // 500MB
-  DOWNLOAD_TIMEOUT: 120000, // 2 minutes
-  CLEANUP_INTERVAL: 60000,
-  MAX_CONCURRENT_DOWNLOADS: 3,
-  ALLOWED_PLATFORMS: [
-    { name: "youtube", domains: ["youtube.com", "youtu.be"] },
-    { name: "tiktok", domains: ["tiktok.com", "vt.tiktok.com"] },
-    { name: "instagram", domains: ["instagram.com"] },
-    { name: "facebook", domains: ["facebook.com", "fb.watch", "fb.gg"] }
-  ],
-  COOKIES_PATH: path.join(__dirname, "cookies.txt")
+ MAX_FILE_SIZE: 500 * 1024 * 1024,
+ DOWNLOAD_TIMEOUT: 120000,
+ CLEANUP_INTERVAL: 60000,
+ MAX_CONCURRENT_DOWNLOADS: 3,
+ ALLOWED_PLATFORMS: [
+   { name: "youtube", domains: ["youtube.com", "youtu.be"] },
+   { name: "tiktok", domains: ["tiktok.com"] },
+   { name: "instagram", domains: ["instagram.com"] },
+   { name: "facebook", domains: ["facebook.com", "fb.watch"] }
+ ],
+ COOKIES_PATH: path.join(__dirname, "cookies.txt")
 };
 
 // ==================== STATE ====================
@@ -30,375 +30,264 @@ let activeDownloads = 0;
 const tempFiles = new Set();
 
 // ==================== MIDDLEWARE ====================
-// CORS - Allow frontend to connect
-app.use(cors({
-  origin: [
-    'http://localhost:3000', 
-    'http://localhost:5500',
-    'http://127.0.0.1:5500',
-    'https://flashvidz.vercel.app', // Add your frontend domain
-    'https://flashvidz.netlify.app'  // Add your frontend domain
-  ],
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
-}));
-
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
+// Rate limit
 const requestCounts = new Map();
 app.use((req, res, next) => {
-  const ip = req.ip || req.connection.remoteAddress;
-  const now = Date.now();
-  const windowStart = now - 15 * 60 * 1000; // 15 min window
+ const ip = req.ip;
+ const now = Date.now();
+ const windowStart = now - 15 * 60 * 1000;
 
-  const requests = requestCounts.get(ip) || [];
-  const recent = requests.filter(t => t > windowStart);
+ const requests = requestCounts.get(ip) || [];
+ const recent = requests.filter(t => t > windowStart);
 
-  if (recent.length >= 10) {
-    return res.status(429).json({ error: "Too many requests. Please wait." });
-  }
+ if (recent.length >= 10) {
+   return res.status(429).json({ success: false, error: "Too many requests" });
+ }
 
-  recent.push(now);
-  requestCounts.set(ip, recent);
-  
-  // Cleanup old entries periodically
-  if (Math.random() < 0.01) {
-    for (const [key, value] of requestCounts.entries()) {
-      const valid = value.filter(t => t > windowStart);
-      if (valid.length === 0) requestCounts.delete(key);
-      else requestCounts.set(key, valid);
-    }
-  }
-  
-  next();
+ recent.push(now);
+ requestCounts.set(ip, recent);
+ next();
 });
 
-// Concurrent download limiter
+// Concurrent limiter
 const downloadLimiter = (req, res, next) => {
-  if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).json({
-      error: "Server busy, try again later"
-    });
-  }
-  next();
+ if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
+   return res.status(503).json({
+     success: false,
+     error: "Server busy, try again later"
+   });
+ }
+ next();
 };
 
 // ==================== VALIDATION ====================
 function validateUrl(url) {
-  try {
-    const parsed = new URL(url);
-    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+ try {
+   const parsed = new URL(url);
+   const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
 
-    const platform = CONFIG.ALLOWED_PLATFORMS.find(p =>
-      p.domains.some(d => hostname === d || hostname.endsWith("." + d))
-    );
+   const platform = CONFIG.ALLOWED_PLATFORMS.find(p =>
+     p.domains.some(d => hostname === d || hostname.endsWith("." + d))
+   );
 
-    if (!platform) return { valid: false, error: "Unsupported platform" };
+   if (!platform) return { valid: false, error: "Unsupported platform" };
 
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      return { valid: false, error: "Invalid protocol" };
-    }
+   if (!["http:", "https:"].includes(parsed.protocol)) {
+     return { valid: false, error: "Invalid protocol" };
+   }
 
-    return { valid: true, platform: platform.name };
-  } catch {
-    return { valid: false, error: "Invalid URL format" };
-  }
+   return { valid: true, platform: platform.name };
+ } catch {
+   return { valid: false, error: "Invalid URL format" };
+ }
 }
 
 // ==================== CLEANUP ====================
 async function cleanupFile(filePath) {
-  if (!filePath) return;
-  tempFiles.delete(filePath);
-  try {
-    await unlinkAsync(filePath);
-    console.log(`🗑️ Cleaned up: ${path.basename(filePath)}`);
-  } catch (err) {
-    // File might already be deleted
-  }
+ if (!filePath) return;
+ tempFiles.delete(filePath);
+ try {
+   await unlinkAsync(filePath);
+ } catch {}
 }
-
-// Periodic cleanup of orphaned temp files
-setInterval(async () => {
-  for (const filePath of tempFiles) {
-    try {
-      const stats = await statAsync(filePath);
-      const age = Date.now() - stats.mtime.getTime();
-      if (age > 300000) { // 5 minutes old
-        await cleanupFile(filePath);
-      }
-    } catch {
-      tempFiles.delete(filePath);
-    }
-  }
-}, CONFIG.CLEANUP_INTERVAL);
 
 // ==================== COOKIES CHECK ====================
 function hasCookies() {
-  return fs.existsSync(CONFIG.COOKIES_PATH);
+ return fs.existsSync(CONFIG.COOKIES_PATH);
 }
 
-// ==================== DOWNLOAD ENDPOINT ====================
+// ==================== DOWNLOAD ====================
 app.post("/download", downloadLimiter, async (req, res) => {
-  const url = req.body?.url?.trim();
-  const clientPlatform = req.body?.platform; // Frontend detected platform
+ const url = req.body?.url?.trim();
+ const format = req.body?.format?.toLowerCase() || "video";
 
-  if (!url) {
-    return res.status(400).json({ error: "No URL provided" });
-  }
+ if (!url) {
+   return res.status(400).json({ success: false, error: "No URL provided" });
+ }
 
-  const validation = validateUrl(url);
-  if (!validation.valid) {
-    return res.status(400).json({ error: validation.error });
-  }
+ if (!["video", "audio"].includes(format)) {
+   return res.status(400).json({ success: false, error: "Invalid format. Use 'video' or 'audio'" });
+ }
 
-  const { platform } = validation;
-  console.log(`\n📥 [${platform}] ${url}`);
-  console.log(`🌐 Client platform hint: ${clientPlatform || 'none'}`);
+ const validation = validateUrl(url);
+ if (!validation.valid) {
+   return res.status(400).json({ success: false, error: validation.error });
+ }
 
-  const tmpDir = os.tmpdir();
-  const fileName = `flashvidz_${platform}_${Date.now()}.mp4`;
-  const filePath = path.join(tmpDir, fileName);
-  tempFiles.add(filePath);
+ const { platform } = validation;
+ console.log(`\n📥 [${platform}] [${format}] ${url}`);
 
-  activeDownloads++;
-  let downloadCompleted = false;
-  let processRef;
-  let timeoutId;
+ const tmpDir = os.tmpdir();
+ const timestamp = Date.now();
+ const extension = format === "audio" ? "mp3" : "mp4";
+ const fileName = `download_${timestamp}.${extension}`;
+ const filePath = path.join(tmpDir, fileName);
+ tempFiles.add(filePath);
 
-  // Timeout handler
-  const cleanup = async () => {
-    if (processRef && !downloadCompleted) {
-      try {
-        processRef.kill("SIGKILL");
-      } catch {}
-    }
-    await cleanupFile(filePath);
-    activeDownloads--;
-  };
+ activeDownloads++;
+ let downloadCompleted = false;
+ let processRef;
 
-  timeoutId = setTimeout(async () => {
-    if (!downloadCompleted) {
-      console.log("⏱️ Timeout - killing process");
-      await cleanup();
-      if (!res.headersSent) {
-        res.status(504).json({ error: "Download timeout" });
-      }
-    }
-  }, CONFIG.DOWNLOAD_TIMEOUT);
+ const timeoutId = setTimeout(async () => {
+   if (!downloadCompleted) {
+     console.log("⏱️ Timeout - killing process");
+     if (processRef) processRef.kill("SIGKILL");
+     await cleanupFile(filePath);
+     activeDownloads--;
+     if (!res.headersSent) {
+       res.status(504).json({ success: false, error: "Download timeout" });
+     }
+   }
+ }, CONFIG.DOWNLOAD_TIMEOUT);
 
-  try {
-    // Build yt-dlp options
-    const options = {
-      output: filePath,
-      format: "best[filesize<500M][ext=mp4]/best[filesize<500M]/best",
-      noPlaylist: true,
-      retries: 3,
-      fragmentRetries: 3,
-      addHeader: [
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language: en-US,en;q=0.9"
-      ],
-      preferFreeFormats: true,
-      forceIpv4: true,
-      noWarnings: true,
-      // Progress hook for logging
-      onProgress: (progress) => {
-        if (progress.percent) {
-          console.log(`⏳ ${platform}: ${progress.percent.toFixed(1)}%`);
-        }
-      }
-    };
+ try {
+   // Build yt-dlp options based on format
+   const options = {
+     output: filePath.replace(`.${extension}`, ".%(ext)s"),
+     noPlaylist: true,
+     retries: 3,
+     fragmentRetries: 3,
+     addHeader: [
+       "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+       "Accept-Language: en-US,en;q=0.9"
+     ],
+     preferFreeFormats: true,
+     forceIpv4: true
+   };
 
-    // Use cookies for Instagram and Facebook (required for private content)
-    if ((platform === "instagram" || platform === "facebook") && hasCookies()) {
-      options.cookies = CONFIG.COOKIES_PATH;
-      console.log(`🍪 Using cookies for ${platform}`);
-    } else if (hasCookies()) {
-      // Optional: use cookies for all platforms for better quality
-      options.cookies = CONFIG.COOKIES_PATH;
-    }
+   if (format === "audio") {
+     // Audio format: best audio, convert to mp3
+     options.format = "bestaudio[filesize<500M]/bestaudio";
+     options.extractAudio = true;
+     options.audioFormat = "mp3";
+     options.audioQuality = "192K";
+   } else {
+     // Video format: best video+audio under 500MB
+     options.format = "best[filesize<500M]/best";
+   }
 
-    // Platform-specific warnings
-    if ((platform === "facebook" || platform === "instagram") && !hasCookies()) {
-      console.log(`⚠️ No cookies - only public ${platform} videos will work`);
-    }
+   // Add cookies for Instagram, Facebook if available
+   if ((platform === "instagram" || platform === "facebook") && hasCookies()) {
+     options.cookies = CONFIG.COOKIES_PATH;
+     console.log(`🍪 Using cookies for ${platform}`);
+   } else if (hasCookies()) {
+     options.cookies = CONFIG.COOKIES_PATH;
+   }
 
-    // Execute download
-    processRef = youtubedl.exec(url, options);
-    await processRef;
+   if (platform === "facebook" && !hasCookies()) {
+     console.log("⚠️ No cookies - public Facebook videos only");
+   }
 
-    clearTimeout(timeoutId);
-    downloadCompleted = true;
+   processRef = youtubedl.exec(url, options);
 
-    // Verify file exists
-    if (!fs.existsSync(filePath)) {
-      throw new Error("Download failed - file not created");
-    }
+   await processRef;
 
-    const stats = await statAsync(filePath);
+   clearTimeout(timeoutId);
+   downloadCompleted = true;
 
-    // Check file size
-    if (stats.size === 0) {
-      throw new Error("Download failed - empty file");
-    }
+   // Find the actual downloaded file (yt-dlp may change extension)
+   const actualFilePath = fs.existsSync(filePath) ? filePath : 
+     fs.existsSync(filePath.replace(`.${extension}`, ".m4a")) ? filePath.replace(`.${extension}`, ".m4a") :
+     fs.existsSync(filePath.replace(`.${extension}`, ".webm")) ? filePath.replace(`.${extension}`, ".webm") :
+     fs.existsSync(filePath.replace(`.${extension}`, ".mp4")) ? filePath.replace(`.${extension}`, ".mp4") : null;
 
-    if (stats.size > CONFIG.MAX_FILE_SIZE) {
-      await cleanupFile(filePath);
-      activeDownloads--;
-      return res.status(413).json({ error: "File too large (max 500MB)" });
-    }
+   if (!actualFilePath || !fs.existsSync(actualFilePath)) {
+     throw new Error("File not created");
+   }
 
-    console.log(`✅ Downloaded: ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
+   const stats = await statAsync(actualFilePath);
 
-    // Set headers for frontend compatibility
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stats.size);
-    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition");
-    
-    // Add custom headers for frontend tracking
-    res.setHeader("X-Download-Platform", platform);
-    res.setHeader("X-File-Size", stats.size);
+   if (stats.size > CONFIG.MAX_FILE_SIZE) {
+     await cleanupFile(actualFilePath);
+     activeDownloads--;
+     return res.status(413).json({ success: false, error: "File too large" });
+   }
 
-    // Stream file to client
-    const stream = fs.createReadStream(filePath);
+   console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
-    stream.on("open", () => {
-      console.log(`📤 Streaming to client...`);
-    });
+   // Set proper content type and headers
+   const contentType = format === "audio" ? "audio/mpeg" : "video/mp4";
+   const downloadFileName = `flashvidz_${platform}_${timestamp}.${extension}`;
 
-    stream.on("error", async (err) => {
-      console.error("❌ Stream error:", err.message);
-      await cleanupFile(filePath);
-      activeDownloads--;
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Streaming failed" });
-      }
-    });
+   res.setHeader("Access-Control-Expose-Headers", "Content-Length");
+   res.setHeader("Content-Length", stats.size);
+   res.setHeader("Content-Type", contentType);
+   res.setHeader("Content-Disposition", `attachment; filename="${downloadFileName}"`);
 
-    stream.on("close", async () => {
-      console.log("✅ Stream complete");
-      activeDownloads--;
-      await cleanupFile(filePath);
-    });
+   const stream = fs.createReadStream(actualFilePath);
 
-    // Handle client disconnect
-    res.on("close", async () => {
-      if (!res.writableEnded) {
-        console.log("⚠️ Client disconnected early");
-        stream.destroy();
-        await cleanupFile(filePath);
-        activeDownloads--;
-      }
-    });
+   stream.on("error", async () => {
+     activeDownloads--;
+     await cleanupFile(actualFilePath);
+   });
 
-    stream.pipe(res);
+   stream.on("close", async () => {
+     activeDownloads--;
+     await cleanupFile(actualFilePath);
+     console.log("✅ Done");
+   });
 
-  } catch (err) {
-    clearTimeout(timeoutId);
-    downloadCompleted = true;
-    activeDownloads--;
-    await cleanupFile(filePath);
+   stream.pipe(res);
 
-    console.error("❌ Download error:", err.message);
+ } catch (err) {
+   clearTimeout(timeoutId);
+   downloadCompleted = true;
+   activeDownloads--;
 
-    // Don't send error if headers already sent
-    if (res.headersSent) return;
+   await cleanupFile(filePath);
 
-    // Smart error messages
-    let errorMessage = "Download failed";
-    let statusCode = 500;
+   console.error("❌", err.message);
 
-    const errMsg = err.message?.toLowerCase() || "";
+   // Handle specific error cases
+   let errorMessage = "Download failed";
+   
+   if (err.message?.includes("login") || err.message?.includes("cookie") || err.message?.includes("private")) {
+     errorMessage = platform === "instagram" || platform === "facebook" 
+       ? `${platform} login required. Please check cookies configuration.`
+       : "Authentication required for this content";
+     console.log("💡 Tip: Update your cookies.txt file");
+   } else if (err.message?.includes("unavailable") || err.message?.includes("not found")) {
+     errorMessage = "Video not found or unavailable";
+   } else if (err.message?.includes("copyright") || err.message?.includes("blocked")) {
+     errorMessage = "Content blocked due to copyright or restrictions";
+   } else if (err.message?.includes("age")) {
+     errorMessage = "Age-restricted content";
+   } else if (err.message?.includes("network") || err.message?.includes("timeout")) {
+     errorMessage = "Network error, please try again";
+   } else if (err.message?.includes("ffmpeg") || err.message?.includes("convert")) {
+     errorMessage = "Audio conversion failed. Video may not have audio track.";
+   }
 
-    // Platform-specific error handling
-    if (errMsg.includes("login") || errMsg.includes("cookie") || errMsg.includes("sign in")) {
-      errorMessage = platform === "youtube" 
-        ? "This video requires login. Try a different video."
-        : `This ${platform} content requires authentication. Please check cookies.`;
-      statusCode = 403;
-    } else if (errMsg.includes("private") || errMsg.includes("restricted")) {
-      errorMessage = `This ${platform} content is private or restricted`;
-      statusCode = 403;
-    } else if (errMsg.includes("not available") || errMsg.includes("unavailable")) {
-      errorMessage = "Video not available or may have been removed";
-      statusCode = 404;
-    } else if (errMsg.includes("copyright") || errMsg.includes("blocked")) {
-      errorMessage = "Video blocked due to copyright or regional restrictions";
-      statusCode = 451;
-    } else if (errMsg.includes("unsupported url") || errMsg.includes("no video")) {
-      errorMessage = "No video found at this URL";
-      statusCode = 400;
-    } else if (errMsg.includes("timeout") || errMsg.includes("etimedout")) {
-      errorMessage = "Download timed out. Try again.";
-      statusCode = 504;
-    } else if (errMsg.includes("rate limit") || errMsg.includes("too many requests")) {
-      errorMessage = "Rate limited by platform. Please wait a moment.";
-      statusCode = 429;
-    }
+   if (res.headersSent) return;
 
-    res.status(statusCode).json({ 
-      error: errorMessage,
-      platform,
-      details: process.env.NODE_ENV === "development" ? err.message : undefined
-    });
-  }
+   res.status(500).json({
+     success: false,
+     platform,
+     format,
+     error: errorMessage,
+     details: err.message
+   });
+ }
 });
 
 // ==================== HEALTH CHECK ====================
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    cookies_configured: hasCookies(),
-    cookies_path: CONFIG.COOKIES_PATH,
-    active_downloads: activeDownloads,
-    max_concurrent: CONFIG.MAX_CONCURRENT_DOWNLOADS,
-    uptime: process.uptime()
-  });
-});
-
-// ==================== INFO ENDPOINT ====================
-app.get("/info", (req, res) => {
-  res.json({
-    name: "FlashVidz API",
-    version: "1.0.0",
-    platforms: CONFIG.ALLOWED_PLATFORMS.map(p => p.name),
-    max_file_size: CONFIG.MAX_FILE_SIZE,
-    features: {
-      cookies_support: hasCookies(),
-      concurrent_downloads: CONFIG.MAX_CONCURRENT_DOWNLOADS
-    }
-  });
-});
-
-// ==================== ERROR HANDLING ====================
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-// Handle uncaught exceptions
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-  // Cleanup temp files before exit
-  Promise.all([...tempFiles].map(cleanupFile)).then(() => {
-    process.exit(1);
-  });
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+ res.json({
+   status: "ok",
+   cookies_configured: hasCookies(),
+   cookies_path: CONFIG.COOKIES_PATH,
+   timestamp: new Date().toISOString()
+ });
 });
 
 // ==================== START ====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 FlashVidz Server running on port ${PORT}`);
-  console.log(`🍪 Cookies: ${hasCookies() ? "✅ Found" : "❌ Not found"} at ${CONFIG.COOKIES_PATH}`);
-  console.log(`📱 Supported platforms: ${CONFIG.ALLOWED_PLATFORMS.map(p => p.name).join(", ")}`);
-  console.log(`⚡ Max concurrent downloads: ${CONFIG.MAX_CONCURRENT_DOWNLOADS}`);
+ console.log(`🚀 Server running on port ${PORT}`);
+ console.log(`🍪 Cookies: ${hasCookies() ? "✅ Found" : "❌ Not found"} at ${CONFIG.COOKIES_PATH}`);
 });
+     
