@@ -12,15 +12,15 @@ const statAsync = promisify(fs.stat);
 
 // ==================== CONFIG ====================
 const CONFIG = {
-  MAX_FILE_SIZE: 500 * 1024 * 1024,
-  DOWNLOAD_TIMEOUT: 120000,
+  MAX_FILE_SIZE: 500 * 1024 * 1024, // 500MB
+  DOWNLOAD_TIMEOUT: 120000, // 2 minutes
   CLEANUP_INTERVAL: 60000,
   MAX_CONCURRENT_DOWNLOADS: 3,
   ALLOWED_PLATFORMS: [
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
-    { name: "tiktok", domains: ["tiktok.com"] },
+    { name: "tiktok", domains: ["tiktok.com", "vt.tiktok.com"] },
     { name: "instagram", domains: ["instagram.com"] },
-    { name: "facebook", domains: ["facebook.com", "fb.watch"] }
+    { name: "facebook", domains: ["facebook.com", "fb.watch", "fb.gg"] }
   ],
   COOKIES_PATH: path.join(__dirname, "cookies.txt")
 };
@@ -30,34 +30,55 @@ let activeDownloads = 0;
 const tempFiles = new Set();
 
 // ==================== MIDDLEWARE ====================
-app.use(cors());
+// CORS - Allow frontend to connect
+app.use(cors({
+  origin: [
+    'http://localhost:3000', 
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'https://flashvidz.vercel.app', // Add your frontend domain
+    'https://flashvidz.netlify.app'  // Add your frontend domain
+  ],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limit
+// Rate limiting
 const requestCounts = new Map();
 app.use((req, res, next) => {
-  const ip = req.ip;
+  const ip = req.ip || req.connection.remoteAddress;
   const now = Date.now();
-  const windowStart = now - 15 * 60 * 1000;
+  const windowStart = now - 15 * 60 * 1000; // 15 min window
 
   const requests = requestCounts.get(ip) || [];
   const recent = requests.filter(t => t > windowStart);
 
   if (recent.length >= 10) {
-    return res.status(429).json({ success: false, error: "Too many requests" });
+    return res.status(429).json({ error: "Too many requests. Please wait." });
   }
 
   recent.push(now);
   requestCounts.set(ip, recent);
+  
+  // Cleanup old entries periodically
+  if (Math.random() < 0.01) {
+    for (const [key, value] of requestCounts.entries()) {
+      const valid = value.filter(t => t > windowStart);
+      if (valid.length === 0) requestCounts.delete(key);
+      else requestCounts.set(key, valid);
+    }
+  }
+  
   next();
 });
 
-// Concurrent limiter
+// Concurrent download limiter
 const downloadLimiter = (req, res, next) => {
   if (activeDownloads >= CONFIG.MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({
-      success: false,
       error: "Server busy, try again later"
     });
   }
@@ -71,7 +92,7 @@ function validateUrl(url) {
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
 
     const platform = CONFIG.ALLOWED_PLATFORMS.find(p =>
-      p.domains.some(d => hostname === d || hostname.endsWith(`.${d}`))
+      p.domains.some(d => hostname === d || hostname.endsWith("." + d))
     );
 
     if (!platform) return { valid: false, error: "Unsupported platform" };
@@ -86,235 +107,243 @@ function validateUrl(url) {
   }
 }
 
-function normalizeFormat(format) {
-  if (typeof format !== "string") return "video";
-  const normalized = format.trim().toLowerCase();
-  return normalized === "audio" ? "audio" : "video";
-}
-
-function getDownloadPlan(format, platform) {
-  const baseName = `${platform}_${Date.now()}`;
-
-  if (format === "audio") {
-    return {
-      format,
-      ytDlpFormat: "bestaudio/best",
-      extractAudio: true,
-      audioFormat: "mp3",
-      extension: "mp3",
-      contentType: "audio/mpeg",
-      downloadName: `${baseName}.mp3`
-    };
-  }
-
-  return {
-    format: "video",
-    ytDlpFormat: "bestvideo+bestaudio/best",
-    extension: "mp4",
-    contentType: "video/mp4",
-    downloadName: `${baseName}.mp4`
-  };
-}
-
-function sanitizeFileName(name) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function mapYtDlpError(err) {
-  const message = err?.stderr || err?.message || "Unknown error";
-  const lower = String(message).toLowerCase();
-
-  if (lower.includes("unsupported url")) {
-    return { status: 400, error: "Unsupported or invalid URL", details: message };
-  }
-
-  if (lower.includes("private") || lower.includes("login") || lower.includes("sign in")) {
-    return { status: 403, error: "This media requires authentication", details: message };
-  }
-
-  if (lower.includes("copyright") || lower.includes("unavailable") || lower.includes("not available")) {
-    return { status: 404, error: "Media is unavailable", details: message };
-  }
-
-  return { status: 500, error: "Download failed", details: message };
-}
-
-async function resolveOutputFile(tmpDir, outputTemplate, extension) {
-  const expected = outputTemplate.replace("%(ext)s", extension);
-  if (fs.existsSync(expected)) return expected;
-
-  const prefix = path.basename(outputTemplate).replace(".%(ext)s", "");
-  const entries = await fs.promises.readdir(tmpDir);
-
-  const match = entries
-    .filter(name => name.startsWith(prefix + "."))
-    .map(name => path.join(tmpDir, name))
-    .find(fullPath => fs.existsSync(fullPath));
-
-  if (match) return match;
-  throw new Error("Downloaded file not found");
-}
-
 // ==================== CLEANUP ====================
 async function cleanupFile(filePath) {
   if (!filePath) return;
   tempFiles.delete(filePath);
   try {
     await unlinkAsync(filePath);
-  } catch {
-    // ignore cleanup failures
+    console.log(`🗑️ Cleaned up: ${path.basename(filePath)}`);
+  } catch (err) {
+    // File might already be deleted
   }
 }
+
+// Periodic cleanup of orphaned temp files
+setInterval(async () => {
+  for (const filePath of tempFiles) {
+    try {
+      const stats = await statAsync(filePath);
+      const age = Date.now() - stats.mtime.getTime();
+      if (age > 300000) { // 5 minutes old
+        await cleanupFile(filePath);
+      }
+    } catch {
+      tempFiles.delete(filePath);
+    }
+  }
+}, CONFIG.CLEANUP_INTERVAL);
 
 // ==================== COOKIES CHECK ====================
 function hasCookies() {
   return fs.existsSync(CONFIG.COOKIES_PATH);
 }
 
-// ==================== DOWNLOAD ====================
+// ==================== DOWNLOAD ENDPOINT ====================
 app.post("/download", downloadLimiter, async (req, res) => {
   const url = req.body?.url?.trim();
-  const requestedFormat = normalizeFormat(req.body?.format);
+  const clientPlatform = req.body?.platform; // Frontend detected platform
 
   if (!url) {
-    return res.status(400).json({ success: false, error: "No URL provided" });
+    return res.status(400).json({ error: "No URL provided" });
   }
 
   const validation = validateUrl(url);
   if (!validation.valid) {
-    return res.status(400).json({ success: false, error: validation.error });
+    return res.status(400).json({ error: validation.error });
   }
 
   const { platform } = validation;
-  const plan = getDownloadPlan(requestedFormat, platform);
-
-  console.log(`\n📥 [${platform}] ${url} (${plan.format})`);
+  console.log(`\n📥 [${platform}] ${url}`);
+  console.log(`🌐 Client platform hint: ${clientPlatform || 'none'}`);
 
   const tmpDir = os.tmpdir();
-  const tempBase = `flashvidz_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const outputTemplate = path.join(tmpDir, `${tempBase}.%(ext)s`);
+  const fileName = `flashvidz_${platform}_${Date.now()}.mp4`;
+  const filePath = path.join(tmpDir, fileName);
+  tempFiles.add(filePath);
 
   activeDownloads++;
   let downloadCompleted = false;
-  let finalized = false;
-  let filePath;
   let processRef;
+  let timeoutId;
 
-  const finishRequest = async () => {
-    if (finalized) return;
-    finalized = true;
-    activeDownloads = Math.max(0, activeDownloads - 1);
+  // Timeout handler
+  const cleanup = async () => {
+    if (processRef && !downloadCompleted) {
+      try {
+        processRef.kill("SIGKILL");
+      } catch {}
+    }
     await cleanupFile(filePath);
+    activeDownloads--;
   };
 
-  const timeoutId = setTimeout(async () => {
-    if (downloadCompleted) return;
-
-    console.log("⏱️ Timeout - killing process");
-    if (processRef && typeof processRef.kill === "function") {
-      processRef.kill("SIGKILL");
-    }
-
-    await finishRequest();
-
-    if (!res.headersSent) {
-      res.status(504).json({ success: false, error: "Download timeout" });
+  timeoutId = setTimeout(async () => {
+    if (!downloadCompleted) {
+      console.log("⏱️ Timeout - killing process");
+      await cleanup();
+      if (!res.headersSent) {
+        res.status(504).json({ error: "Download timeout" });
+      }
     }
   }, CONFIG.DOWNLOAD_TIMEOUT);
 
   try {
+    // Build yt-dlp options
     const options = {
-      output: outputTemplate,
-      format: plan.ytDlpFormat,
+      output: filePath,
+      format: "best[filesize<500M][ext=mp4]/best[filesize<500M]/best",
       noPlaylist: true,
       retries: 3,
       fragmentRetries: 3,
       addHeader: [
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language: en-US,en;q=0.9"
       ],
       preferFreeFormats: true,
       forceIpv4: true,
-      noCheckCertificates: true
+      noWarnings: true,
+      // Progress hook for logging
+      onProgress: (progress) => {
+        if (progress.percent) {
+          console.log(`⏳ ${platform}: ${progress.percent.toFixed(1)}%`);
+        }
+      }
     };
 
-    if (plan.extractAudio) {
-      options.extractAudio = true;
-      options.audioFormat = plan.audioFormat;
-      options.audioQuality = 0;
-    }
-
-    if (hasCookies()) {
+    // Use cookies for Instagram and Facebook (required for private content)
+    if ((platform === "instagram" || platform === "facebook") && hasCookies()) {
       options.cookies = CONFIG.COOKIES_PATH;
-      if (platform === "instagram" || platform === "facebook") {
-        console.log(`🍪 Using cookies for ${platform}`);
-      }
-    } else if (platform === "facebook") {
-      console.log("⚠️ No cookies - public Facebook videos only");
+      console.log(`🍪 Using cookies for ${platform}`);
+    } else if (hasCookies()) {
+      // Optional: use cookies for all platforms for better quality
+      options.cookies = CONFIG.COOKIES_PATH;
     }
 
+    // Platform-specific warnings
+    if ((platform === "facebook" || platform === "instagram") && !hasCookies()) {
+      console.log(`⚠️ No cookies - only public ${platform} videos will work`);
+    }
+
+    // Execute download
     processRef = youtubedl.exec(url, options);
     await processRef;
 
     clearTimeout(timeoutId);
     downloadCompleted = true;
 
-    filePath = await resolveOutputFile(tmpDir, outputTemplate, plan.extension);
-    tempFiles.add(filePath);
-
+    // Verify file exists
     if (!fs.existsSync(filePath)) {
-      throw new Error("File not created");
+      throw new Error("Download failed - file not created");
     }
 
     const stats = await statAsync(filePath);
 
-    if (stats.size > CONFIG.MAX_FILE_SIZE) {
-      await finishRequest();
-      return res.status(413).json({ success: false, error: "File too large" });
+    // Check file size
+    if (stats.size === 0) {
+      throw new Error("Download failed - empty file");
     }
 
-    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
+    if (stats.size > CONFIG.MAX_FILE_SIZE) {
+      await cleanupFile(filePath);
+      activeDownloads--;
+      return res.status(413).json({ error: "File too large (max 500MB)" });
+    }
 
-    const safeName = sanitizeFileName(plan.downloadName);
+    console.log(`✅ Downloaded: ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, Content-Type");
+    // Set headers for frontend compatibility
+    res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Length", stats.size);
-    res.setHeader("Content-Type", plan.contentType);
-    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition");
+    
+    // Add custom headers for frontend tracking
+    res.setHeader("X-Download-Platform", platform);
+    res.setHeader("X-File-Size", stats.size);
 
+    // Stream file to client
     const stream = fs.createReadStream(filePath);
 
-    stream.on("error", async () => {
-      await finishRequest();
+    stream.on("open", () => {
+      console.log(`📤 Streaming to client...`);
+    });
+
+    stream.on("error", async (err) => {
+      console.error("❌ Stream error:", err.message);
+      await cleanupFile(filePath);
+      activeDownloads--;
       if (!res.headersSent) {
-        res.status(500).json({ success: false, error: "Failed to stream file" });
+        res.status(500).json({ error: "Streaming failed" });
       }
     });
 
+    stream.on("close", async () => {
+      console.log("✅ Stream complete");
+      activeDownloads--;
+      await cleanupFile(filePath);
+    });
+
+    // Handle client disconnect
     res.on("close", async () => {
-      await finishRequest();
-      console.log("✅ Done");
+      if (!res.writableEnded) {
+        console.log("⚠️ Client disconnected early");
+        stream.destroy();
+        await cleanupFile(filePath);
+        activeDownloads--;
+      }
     });
 
     stream.pipe(res);
+
   } catch (err) {
     clearTimeout(timeoutId);
     downloadCompleted = true;
+    activeDownloads--;
+    await cleanupFile(filePath);
 
-    const mapped = mapYtDlpError(err);
+    console.error("❌ Download error:", err.message);
 
-    console.error("❌", mapped.details);
-
-    await finishRequest();
-
+    // Don't send error if headers already sent
     if (res.headersSent) return;
 
-    res.status(mapped.status).json({
-      success: false,
+    // Smart error messages
+    let errorMessage = "Download failed";
+    let statusCode = 500;
+
+    const errMsg = err.message?.toLowerCase() || "";
+
+    // Platform-specific error handling
+    if (errMsg.includes("login") || errMsg.includes("cookie") || errMsg.includes("sign in")) {
+      errorMessage = platform === "youtube" 
+        ? "This video requires login. Try a different video."
+        : `This ${platform} content requires authentication. Please check cookies.`;
+      statusCode = 403;
+    } else if (errMsg.includes("private") || errMsg.includes("restricted")) {
+      errorMessage = `This ${platform} content is private or restricted`;
+      statusCode = 403;
+    } else if (errMsg.includes("not available") || errMsg.includes("unavailable")) {
+      errorMessage = "Video not available or may have been removed";
+      statusCode = 404;
+    } else if (errMsg.includes("copyright") || errMsg.includes("blocked")) {
+      errorMessage = "Video blocked due to copyright or regional restrictions";
+      statusCode = 451;
+    } else if (errMsg.includes("unsupported url") || errMsg.includes("no video")) {
+      errorMessage = "No video found at this URL";
+      statusCode = 400;
+    } else if (errMsg.includes("timeout") || errMsg.includes("etimedout")) {
+      errorMessage = "Download timed out. Try again.";
+      statusCode = 504;
+    } else if (errMsg.includes("rate limit") || errMsg.includes("too many requests")) {
+      errorMessage = "Rate limited by platform. Please wait a moment.";
+      statusCode = 429;
+    }
+
+    res.status(statusCode).json({ 
+      error: errorMessage,
       platform,
-      format: plan.format,
-      error: mapped.error,
-      details: mapped.details
+      details: process.env.NODE_ENV === "development" ? err.message : undefined
     });
   }
 });
@@ -323,15 +352,53 @@ app.post("/download", downloadLimiter, async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
+    timestamp: new Date().toISOString(),
     cookies_configured: hasCookies(),
     cookies_path: CONFIG.COOKIES_PATH,
-    timestamp: new Date().toISOString()
+    active_downloads: activeDownloads,
+    max_concurrent: CONFIG.MAX_CONCURRENT_DOWNLOADS,
+    uptime: process.uptime()
   });
+});
+
+// ==================== INFO ENDPOINT ====================
+app.get("/info", (req, res) => {
+  res.json({
+    name: "FlashVidz API",
+    version: "1.0.0",
+    platforms: CONFIG.ALLOWED_PLATFORMS.map(p => p.name),
+    max_file_size: CONFIG.MAX_FILE_SIZE,
+    features: {
+      cookies_support: hasCookies(),
+      concurrent_downloads: CONFIG.MAX_CONCURRENT_DOWNLOADS
+    }
+  });
+});
+
+// ==================== ERROR HANDLING ====================
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+  // Cleanup temp files before exit
+  Promise.all([...tempFiles].map(cleanupFile)).then(() => {
+    process.exit(1);
+  });
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
 
 // ==================== START ====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 FlashVidz Server running on port ${PORT}`);
   console.log(`🍪 Cookies: ${hasCookies() ? "✅ Found" : "❌ Not found"} at ${CONFIG.COOKIES_PATH}`);
+  console.log(`📱 Supported platforms: ${CONFIG.ALLOWED_PLATFORMS.map(p => p.name).join(", ")}`);
+  console.log(`⚡ Max concurrent downloads: ${CONFIG.MAX_CONCURRENT_DOWNLOADS}`);
 });
