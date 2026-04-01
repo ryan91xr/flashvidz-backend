@@ -20,9 +20,8 @@ const CONFIG = {
     { name: "youtube", domains: ["youtube.com", "youtu.be"] },
     { name: "tiktok", domains: ["tiktok.com"] },
     { name: "instagram", domains: ["instagram.com"] },
-    { name: "facebook", domains: ["facebook.com", "fb.watch"] } // ✅ Added Facebook
+    { name: "facebook", domains: ["facebook.com", "fb.watch"] }
   ],
-  // Path to your cookies.txt file
   COOKIES_PATH: path.join(__dirname, "cookies.txt")
 };
 
@@ -72,7 +71,7 @@ function validateUrl(url) {
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
 
     const platform = CONFIG.ALLOWED_PLATFORMS.find(p =>
-      p.domains.some(d => hostname === d || hostname.endsWith("." + d))
+      p.domains.some(d => hostname === d || hostname.endsWith(`.${d}`))
     );
 
     if (!platform) return { valid: false, error: "Unsupported platform" };
@@ -87,13 +86,84 @@ function validateUrl(url) {
   }
 }
 
+function normalizeFormat(format) {
+  if (typeof format !== "string") return "video";
+  const normalized = format.trim().toLowerCase();
+  return normalized === "audio" ? "audio" : "video";
+}
+
+function getDownloadPlan(format, platform) {
+  const baseName = `${platform}_${Date.now()}`;
+
+  if (format === "audio") {
+    return {
+      format,
+      ytDlpFormat: "bestaudio/best",
+      extractAudio: true,
+      audioFormat: "mp3",
+      extension: "mp3",
+      contentType: "audio/mpeg",
+      downloadName: `${baseName}.mp3`
+    };
+  }
+
+  return {
+    format: "video",
+    ytDlpFormat: "bestvideo+bestaudio/best",
+    extension: "mp4",
+    contentType: "video/mp4",
+    downloadName: `${baseName}.mp4`
+  };
+}
+
+function sanitizeFileName(name) {
+  return name.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function mapYtDlpError(err) {
+  const message = err?.stderr || err?.message || "Unknown error";
+  const lower = String(message).toLowerCase();
+
+  if (lower.includes("unsupported url")) {
+    return { status: 400, error: "Unsupported or invalid URL", details: message };
+  }
+
+  if (lower.includes("private") || lower.includes("login") || lower.includes("sign in")) {
+    return { status: 403, error: "This media requires authentication", details: message };
+  }
+
+  if (lower.includes("copyright") || lower.includes("unavailable") || lower.includes("not available")) {
+    return { status: 404, error: "Media is unavailable", details: message };
+  }
+
+  return { status: 500, error: "Download failed", details: message };
+}
+
+async function resolveOutputFile(tmpDir, outputTemplate, extension) {
+  const expected = outputTemplate.replace("%(ext)s", extension);
+  if (fs.existsSync(expected)) return expected;
+
+  const prefix = path.basename(outputTemplate).replace(".%(ext)s", "");
+  const entries = await fs.promises.readdir(tmpDir);
+
+  const match = entries
+    .filter(name => name.startsWith(prefix + "."))
+    .map(name => path.join(tmpDir, name))
+    .find(fullPath => fs.existsSync(fullPath));
+
+  if (match) return match;
+  throw new Error("Downloaded file not found");
+}
+
 // ==================== CLEANUP ====================
 async function cleanupFile(filePath) {
   if (!filePath) return;
   tempFiles.delete(filePath);
   try {
     await unlinkAsync(filePath);
-  } catch {}
+  } catch {
+    // ignore cleanup failures
+  }
 }
 
 // ==================== COOKIES CHECK ====================
@@ -104,6 +174,7 @@ function hasCookies() {
 // ==================== DOWNLOAD ====================
 app.post("/download", downloadLimiter, async (req, res) => {
   const url = req.body?.url?.trim();
+  const requestedFormat = normalizeFormat(req.body?.format);
 
   if (!url) {
     return res.status(400).json({ success: false, error: "No URL provided" });
@@ -115,35 +186,46 @@ app.post("/download", downloadLimiter, async (req, res) => {
   }
 
   const { platform } = validation;
-  console.log(`\n📥 [${platform}] ${url}`);
+  const plan = getDownloadPlan(requestedFormat, platform);
+
+  console.log(`\n📥 [${platform}] ${url} (${plan.format})`);
 
   const tmpDir = os.tmpdir();
-  const fileName = `video_${Date.now()}.mp4`;
-  const filePath = path.join(tmpDir, fileName);
-  tempFiles.add(filePath);
+  const tempBase = `flashvidz_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const outputTemplate = path.join(tmpDir, `${tempBase}.%(ext)s`);
 
   activeDownloads++;
   let downloadCompleted = false;
-
+  let finalized = false;
+  let filePath;
   let processRef;
 
+  const finishRequest = async () => {
+    if (finalized) return;
+    finalized = true;
+    activeDownloads = Math.max(0, activeDownloads - 1);
+    await cleanupFile(filePath);
+  };
+
   const timeoutId = setTimeout(async () => {
-    if (!downloadCompleted) {
-      console.log("⏱️ Timeout - killing process");
-      if (processRef) processRef.kill("SIGKILL");
-      await cleanupFile(filePath);
-      activeDownloads--;
-      if (!res.headersSent) {
-        res.status(504).json({ success: false, error: "Download timeout" });
-      }
+    if (downloadCompleted) return;
+
+    console.log("⏱️ Timeout - killing process");
+    if (processRef && typeof processRef.kill === "function") {
+      processRef.kill("SIGKILL");
+    }
+
+    await finishRequest();
+
+    if (!res.headersSent) {
+      res.status(504).json({ success: false, error: "Download timeout" });
     }
   }, CONFIG.DOWNLOAD_TIMEOUT);
 
   try {
-    // Build yt-dlp options
     const options = {
-      output: filePath,
-      format: "best[filesize<500M]/best",
+      output: outputTemplate,
+      format: plan.ytDlpFormat,
       noPlaylist: true,
       retries: 3,
       fragmentRetries: 3,
@@ -152,29 +234,33 @@ app.post("/download", downloadLimiter, async (req, res) => {
         "Accept-Language: en-US,en;q=0.9"
       ],
       preferFreeFormats: true,
-      forceIpv4: true
+      forceIpv4: true,
+      noCheckCertificates: true
     };
 
-    // ✅ ADD COOKIES for Instagram, Facebook, and others if available
-    if ((platform === "instagram" || platform === "facebook") && hasCookies()) {
-      options.cookies = CONFIG.COOKIES_PATH;
-      console.log(`🍪 Using cookies for ${platform}`);
-    } else if (hasCookies()) {
-      // Optional: use cookies for all platforms
-      options.cookies = CONFIG.COOKIES_PATH;
+    if (plan.extractAudio) {
+      options.extractAudio = true;
+      options.audioFormat = plan.audioFormat;
+      options.audioQuality = 0;
     }
 
-    // Facebook-specific: warn if no cookies
-    if (platform === "facebook" && !hasCookies()) {
+    if (hasCookies()) {
+      options.cookies = CONFIG.COOKIES_PATH;
+      if (platform === "instagram" || platform === "facebook") {
+        console.log(`🍪 Using cookies for ${platform}`);
+      }
+    } else if (platform === "facebook") {
       console.log("⚠️ No cookies - public Facebook videos only");
     }
 
     processRef = youtubedl.exec(url, options);
-
     await processRef;
 
     clearTimeout(timeoutId);
     downloadCompleted = true;
+
+    filePath = await resolveOutputFile(tmpDir, outputTemplate, plan.extension);
+    tempFiles.add(filePath);
 
     if (!fs.existsSync(filePath)) {
       throw new Error("File not created");
@@ -183,54 +269,52 @@ app.post("/download", downloadLimiter, async (req, res) => {
     const stats = await statAsync(filePath);
 
     if (stats.size > CONFIG.MAX_FILE_SIZE) {
-      await cleanupFile(filePath);
-      activeDownloads--;
+      await finishRequest();
       return res.status(413).json({ success: false, error: "File too large" });
     }
 
     console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length");
+    const safeName = sanitizeFileName(plan.downloadName);
+
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, Content-Type");
     res.setHeader("Content-Length", stats.size);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="video_${platform}.mp4"`);
+    res.setHeader("Content-Type", plan.contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
 
     const stream = fs.createReadStream(filePath);
 
     stream.on("error", async () => {
-      activeDownloads--;
-      await cleanupFile(filePath);
+      await finishRequest();
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: "Failed to stream file" });
+      }
     });
 
-    stream.on("close", async () => {
-      activeDownloads--;
-      await cleanupFile(filePath);
+    res.on("close", async () => {
+      await finishRequest();
       console.log("✅ Done");
     });
 
     stream.pipe(res);
-
   } catch (err) {
     clearTimeout(timeoutId);
     downloadCompleted = true;
-    activeDownloads--;
 
-    await cleanupFile(filePath);
+    const mapped = mapYtDlpError(err);
 
-    console.error("❌", err.message);
+    console.error("❌", mapped.details);
 
-    // Check if it's an authentication error
-    if (err.message?.includes("login") || err.message?.includes("cookie") || err.message?.includes("private")) {
-      console.log("💡 Tip: Update your cookies.txt file");
-    }
+    await finishRequest();
 
     if (res.headersSent) return;
 
-    res.status(500).json({
+    res.status(mapped.status).json({
       success: false,
       platform,
-      error: "Download failed",
-      details: err.message
+      format: plan.format,
+      error: mapped.error,
+      details: mapped.details
     });
   }
 });
