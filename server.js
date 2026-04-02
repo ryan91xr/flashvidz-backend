@@ -206,13 +206,15 @@ app.post("/download", downloadLimiter, async (req, res) => {
 
    const publicFileName = path.basename(actualFilePath);
    const baseUrl = `https://${req.get("host")}`;
-   const publicUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
+   const fileUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
 
    activeDownloads--;
    return res.json({
      success: true,
-     url: publicUrl,
-     format
+     url: fileUrl,
+     format,
+     fileName: publicFileName,
+     fileSize: stats.size
    });
  } catch (err) {
    clearTimeout(timeoutId);
