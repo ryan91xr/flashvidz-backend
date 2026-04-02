@@ -8,6 +8,22 @@ const youtubedl = require("yt-dlp-exec");
 const app = express();
 const statAsync = promisify(fs.stat);
 
+function formatFileSize(bytes) {
+ if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+ if (bytes < 1024) return `${bytes} B`;
+
+ const units = ["KB", "MB", "GB", "TB"];
+ let size = bytes / 1024;
+ let unitIndex = 0;
+
+ while (size >= 1024 && unitIndex < units.length - 1) {
+   size /= 1024;
+   unitIndex++;
+ }
+
+ return `${size.toFixed(2)} ${units[unitIndex]}`;
+}
+
 // ==================== CONFIG ====================
 const downloadsDir = path.join(__dirname, "downloads");
 if (!fs.existsSync(downloadsDir)) {
@@ -36,6 +52,17 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use("/files", express.static(downloadsDir));
+
+app.get("/files/:fileName/download", (req, res) => {
+ const safeFileName = path.basename(req.params.fileName);
+ const targetPath = path.join(downloadsDir, safeFileName);
+
+ if (!fs.existsSync(targetPath)) {
+   return res.status(404).json({ success: false, error: "File not found" });
+ }
+
+ return res.download(targetPath, safeFileName);
+});
 
 // Rate limit
 const requestCounts = new Map();
@@ -205,16 +232,22 @@ app.post("/download", downloadLimiter, async (req, res) => {
    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
    const publicFileName = path.basename(actualFilePath);
-   const baseUrl = `https://${req.get("host")}`;
+   const forwardedProto = req.get("x-forwarded-proto");
+   const protocol = forwardedProto ? forwardedProto.split(",")[0].trim() : req.protocol;
+   const baseUrl = `${protocol}://${req.get("host")}`;
    const fileUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
+   const autoDownloadUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}/download`;
 
    activeDownloads--;
    return res.json({
      success: true,
      url: fileUrl,
+     downloadUrl: autoDownloadUrl,
      format,
      fileName: publicFileName,
-     fileSize: stats.size
+     fileSize: formatFileSize(stats.size),
+     fileSizeBytes: stats.size,
+     autoDownload: true
    });
  } catch (err) {
    clearTimeout(timeoutId);
