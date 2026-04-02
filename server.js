@@ -242,6 +242,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
    return res.json({
      success: true,
      url: fileUrl,
+     fileUrl: fileUrl,
      downloadUrl: autoDownloadUrl,
      format,
      fileName: publicFileName,
