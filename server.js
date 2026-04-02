@@ -205,7 +205,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
    const publicFileName = path.basename(actualFilePath);
-   const baseUrl = `${req.protocol}://${req.get("host")}`;
+   const baseUrl = `https://${req.get("host")}`;
    const publicUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
 
    activeDownloads--;
