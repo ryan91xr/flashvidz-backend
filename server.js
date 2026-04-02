@@ -4,13 +4,16 @@ const fs = require("fs");
 const path = require("path");
 const { promisify } = require("util");
 const youtubedl = require("yt-dlp-exec");
-const os = require("os");
 
 const app = express();
-const unlinkAsync = promisify(fs.unlink);
 const statAsync = promisify(fs.stat);
 
 // ==================== CONFIG ====================
+const downloadsDir = path.join(__dirname, "downloads");
+if (!fs.existsSync(downloadsDir)) {
+ fs.mkdirSync(downloadsDir, { recursive: true });
+}
+
 const CONFIG = {
  MAX_FILE_SIZE: 500 * 1024 * 1024,
  DOWNLOAD_TIMEOUT: 120000,
@@ -27,12 +30,12 @@ const CONFIG = {
 
 // ==================== STATE ====================
 let activeDownloads = 0;
-const tempFiles = new Set();
 
 // ==================== MIDDLEWARE ====================
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use("/files", express.static(downloadsDir));
 
 // Rate limit
 const requestCounts = new Map();
@@ -86,15 +89,6 @@ function validateUrl(url) {
  }
 }
 
-// ==================== CLEANUP ====================
-async function cleanupFile(filePath) {
- if (!filePath) return;
- tempFiles.delete(filePath);
- try {
-   await unlinkAsync(filePath);
- } catch {}
-}
-
 // ==================== COOKIES CHECK ====================
 function hasCookies() {
  return fs.existsSync(CONFIG.COOKIES_PATH);
@@ -121,12 +115,10 @@ app.post("/download", downloadLimiter, async (req, res) => {
  const { platform } = validation;
  console.log(`\n📥 [${platform}] [${format}] ${url}`);
 
- const tmpDir = os.tmpdir();
  const timestamp = Date.now();
  const extension = format === "audio" ? "mp3" : "mp4";
- const fileName = `download_${timestamp}.${extension}`;
- const filePath = path.join(tmpDir, fileName);
- tempFiles.add(filePath);
+ const fileName = `download_${platform}_${timestamp}.${extension}`;
+ const filePath = path.join(downloadsDir, fileName);
 
  activeDownloads++;
  let downloadCompleted = false;
@@ -136,7 +128,6 @@ app.post("/download", downloadLimiter, async (req, res) => {
    if (!downloadCompleted) {
      console.log("⏱️ Timeout - killing process");
      if (processRef) processRef.kill("SIGKILL");
-     await cleanupFile(filePath);
      activeDownloads--;
      if (!res.headersSent) {
        res.status(504).json({ success: false, error: "Download timeout" });
@@ -190,10 +181,15 @@ app.post("/download", downloadLimiter, async (req, res) => {
    downloadCompleted = true;
 
    // Find the actual downloaded file (yt-dlp may change extension)
-   const actualFilePath = fs.existsSync(filePath) ? filePath : 
-     fs.existsSync(filePath.replace(`.${extension}`, ".m4a")) ? filePath.replace(`.${extension}`, ".m4a") :
-     fs.existsSync(filePath.replace(`.${extension}`, ".webm")) ? filePath.replace(`.${extension}`, ".webm") :
-     fs.existsSync(filePath.replace(`.${extension}`, ".mp4")) ? filePath.replace(`.${extension}`, ".mp4") : null;
+   const actualFilePath = fs.existsSync(filePath)
+     ? filePath
+     : fs.existsSync(filePath.replace(`.${extension}`, ".m4a"))
+       ? filePath.replace(`.${extension}`, ".m4a")
+       : fs.existsSync(filePath.replace(`.${extension}`, ".webm"))
+         ? filePath.replace(`.${extension}`, ".webm")
+         : fs.existsSync(filePath.replace(`.${extension}`, ".mp4"))
+           ? filePath.replace(`.${extension}`, ".mp4")
+           : null;
 
    if (!actualFilePath || !fs.existsSync(actualFilePath)) {
      throw new Error("File not created");
@@ -202,51 +198,34 @@ app.post("/download", downloadLimiter, async (req, res) => {
    const stats = await statAsync(actualFilePath);
 
    if (stats.size > CONFIG.MAX_FILE_SIZE) {
-     await cleanupFile(actualFilePath);
      activeDownloads--;
      return res.status(413).json({ success: false, error: "File too large" });
    }
 
    console.log(`✅ ${(stats.size / 1024 / 1024).toFixed(2)}MB`);
 
-   // Set proper content type and headers
-   const contentType = format === "audio" ? "audio/mpeg" : "video/mp4";
-   const downloadFileName = `flashvidz_${platform}_${timestamp}.${extension}`;
+   const publicFileName = path.basename(actualFilePath);
+   const baseUrl = `${req.protocol}://${req.get("host")}`;
+   const publicUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
 
-   res.setHeader("Access-Control-Expose-Headers", "Content-Length");
-   res.setHeader("Content-Length", stats.size);
-   res.setHeader("Content-Type", contentType);
-   res.setHeader("Content-Disposition", `attachment; filename="${downloadFileName}"`);
-
-   const stream = fs.createReadStream(actualFilePath);
-
-   stream.on("error", async () => {
-     activeDownloads--;
-     await cleanupFile(actualFilePath);
+   activeDownloads--;
+   return res.json({
+     success: true,
+     url: publicUrl,
+     format
    });
-
-   stream.on("close", async () => {
-     activeDownloads--;
-     await cleanupFile(actualFilePath);
-     console.log("✅ Done");
-   });
-
-   stream.pipe(res);
-
  } catch (err) {
    clearTimeout(timeoutId);
    downloadCompleted = true;
    activeDownloads--;
 
-   await cleanupFile(filePath);
-
    console.error("❌", err.message);
 
    // Handle specific error cases
    let errorMessage = "Download failed";
-   
+
    if (err.message?.includes("login") || err.message?.includes("cookie") || err.message?.includes("private")) {
-     errorMessage = platform === "instagram" || platform === "facebook" 
+     errorMessage = platform === "instagram" || platform === "facebook"
        ? `${platform} login required. Please check cookies configuration.`
        : "Authentication required for this content";
      console.log("💡 Tip: Update your cookies.txt file");
@@ -280,6 +259,7 @@ app.get("/health", (req, res) => {
    status: "ok",
    cookies_configured: hasCookies(),
    cookies_path: CONFIG.COOKIES_PATH,
+   downloads_path: downloadsDir,
    timestamp: new Date().toISOString()
  });
 });
@@ -288,6 +268,6 @@ app.get("/health", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
  console.log(`🚀 Server running on port ${PORT}`);
+ console.log(`📁 Downloads: ${downloadsDir}`);
  console.log(`🍪 Cookies: ${hasCookies() ? "✅ Found" : "❌ Not found"} at ${CONFIG.COOKIES_PATH}`);
 });
-     
