@@ -271,14 +271,6 @@ app.post("/download", downloadLimiter, async (req, res) => {
    }
 
    const thumbnail = await fetchThumbnailUrl(url, platform, options);
-   const thumbnailRequiredPlatforms = new Set(["youtube", "tiktok", "instagram"]);
-   if (thumbnailRequiredPlatforms.has(platform) && !thumbnail) {
-     activeDownloads--;
-     return res.status(502).json({
-       success: false,
-       error: `Unable to resolve a public HTTPS thumbnail URL for ${platform}`
-     });
-   }
 
    processRef = youtubedl.exec(url, options);
 
@@ -325,7 +317,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
      fileUrl: fileUrl,
      downloadUrl: autoDownloadUrl,
      format,
-     thumbnail,
+     thumbnail: thumbnail || null,
      fileName: publicFileName,
      fileSize: formatFileSize(stats.size),
      fileSizeBytes: stats.size,
