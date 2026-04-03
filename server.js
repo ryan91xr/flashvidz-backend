@@ -8,6 +8,76 @@ const youtubedl = require("yt-dlp-exec");
 const app = express();
 const statAsync = promisify(fs.stat);
 
+function isPublicHostname(hostname) {
+ if (!hostname) return false;
+
+ const host = hostname.toLowerCase();
+ if (host === "localhost" || host.endsWith(".local")) return false;
+
+ // Basic private/loopback/link-local IPv4 checks
+ if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+   if (host.startsWith("10.") || host.startsWith("127.") || host.startsWith("192.168.")) return false;
+   const secondOctet = Number(host.split(".")[1] || 0);
+   if (host.startsWith("172.") && secondOctet >= 16 && secondOctet <= 31) return false;
+   if (host.startsWith("169.254.")) return false;
+ }
+
+ // Basic IPv6 local checks
+ if (host === "::1" || host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")) {
+   return false;
+ }
+
+ return true;
+}
+
+function normalizeThumbnailUrl(rawUrl) {
+ if (!rawUrl || typeof rawUrl !== "string") return null;
+
+ const trimmed = rawUrl.trim();
+ const normalized = trimmed.startsWith("//") ? `https:${trimmed}` : trimmed;
+
+ try {
+   const parsed = new URL(normalized);
+   if (!["https:", "http:"].includes(parsed.protocol)) return null;
+   if (!isPublicHostname(parsed.hostname)) return null;
+
+   // Enforce HTTPS in response payload
+   parsed.protocol = "https:";
+   return parsed.toString();
+ } catch {
+   return null;
+ }
+}
+
+async function fetchThumbnailUrl(url, platform, sharedOptions = {}) {
+ try {
+   const metadataOptions = {
+     ...sharedOptions,
+     skipDownload: true,
+     dumpSingleJson: true,
+     noPlaylist: true,
+     quiet: true,
+     noWarnings: true
+   };
+
+   const output = await youtubedl(url, metadataOptions);
+   const metadata = JSON.parse(output);
+   const candidates = [
+     metadata?.thumbnail,
+     ...(Array.isArray(metadata?.thumbnails) ? metadata.thumbnails.map(item => item?.url) : [])
+   ];
+
+   for (let i = candidates.length - 1; i >= 0; i--) {
+     const normalized = normalizeThumbnailUrl(candidates[i]);
+     if (normalized) return normalized;
+   }
+ } catch (error) {
+   console.warn(`⚠️ Unable to fetch thumbnail metadata for ${platform}: ${error.message}`);
+ }
+
+ return null;
+}
+
 function formatFileSize(bytes) {
  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
  if (bytes < 1024) return `${bytes} B`;
@@ -200,6 +270,16 @@ app.post("/download", downloadLimiter, async (req, res) => {
      console.log("⚠️ No cookies - public Facebook videos only");
    }
 
+   const thumbnail = await fetchThumbnailUrl(url, platform, options);
+   const thumbnailRequiredPlatforms = new Set(["youtube", "tiktok", "instagram"]);
+   if (thumbnailRequiredPlatforms.has(platform) && !thumbnail) {
+     activeDownloads--;
+     return res.status(502).json({
+       success: false,
+       error: `Unable to resolve a public HTTPS thumbnail URL for ${platform}`
+     });
+   }
+
    processRef = youtubedl.exec(url, options);
 
    await processRef;
@@ -245,6 +325,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
      fileUrl: fileUrl,
      downloadUrl: autoDownloadUrl,
      format,
+     thumbnail,
      fileName: publicFileName,
      fileSize: formatFileSize(stats.size),
      fileSizeBytes: stats.size,
