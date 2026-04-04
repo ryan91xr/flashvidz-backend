@@ -270,6 +270,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
      console.log("⚠️ No cookies - public Facebook videos only");
    }
 
+   // Thumbnail is optional and must never block downloads.
    const thumbnail = await fetchThumbnailUrl(url, platform, options);
 
    processRef = youtubedl.exec(url, options);
