@@ -49,7 +49,7 @@ function normalizeThumbnailUrl(rawUrl) {
  }
 }
 
-async function fetchThumbnailUrl(url, platform, sharedOptions = {}) {
+async function fetchMediaMetadata(url, platform, sharedOptions = {}) {
  try {
    const metadataOptions = {
      ...sharedOptions,
@@ -67,15 +67,24 @@ async function fetchThumbnailUrl(url, platform, sharedOptions = {}) {
      ...(Array.isArray(metadata?.thumbnails) ? metadata.thumbnails.map(item => item?.url) : [])
    ];
 
+   let thumbnail = null;
    for (let i = candidates.length - 1; i >= 0; i--) {
      const normalized = normalizeThumbnailUrl(candidates[i]);
-     if (normalized) return normalized;
+     if (normalized) {
+       thumbnail = normalized;
+       break;
+     }
    }
+
+   return {
+     thumbnail,
+     duration: metadata?.duration_string || null
+   };
  } catch (error) {
    console.warn(`⚠️ Unable to fetch thumbnail metadata for ${platform}: ${error.message}`);
  }
 
- return null;
+ return { thumbnail: null, duration: null };
 }
 
 function formatFileSize(bytes) {
@@ -271,7 +280,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
    }
 
    // Thumbnail is optional and must never block downloads.
-   const thumbnail = await fetchThumbnailUrl(url, platform, options);
+   const mediaMetadata = await fetchMediaMetadata(url, platform, options);
 
    processRef = youtubedl.exec(url, options);
 
@@ -318,7 +327,8 @@ app.post("/download", downloadLimiter, async (req, res) => {
      fileUrl: fileUrl,
      downloadUrl: autoDownloadUrl,
      format,
-     thumbnail: thumbnail || null,
+     thumbnail: mediaMetadata.thumbnail || null,
+     duration: mediaMetadata.duration || null,
      fileName: publicFileName,
      fileSize: formatFileSize(stats.size),
      fileSizeBytes: stats.size,
