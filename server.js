@@ -325,9 +325,9 @@ app.post("/download", downloadLimiter, async (req, res) => {
      thumbnail = `https:${thumbnail}`;
    }
 
-   if (!thumbnail) {
-     thumbnail = `https://via.placeholder.com/300x400?text=${platform}`;
-   }
+  if (!thumbnail) {
+    thumbnail = `https://dummyimage.com/300x400/1c2b33/00d4aa&text=${platform}`;
+  }
 
    activeDownloads--;
    return res.json({
