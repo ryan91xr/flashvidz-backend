@@ -319,6 +319,15 @@ app.post("/download", downloadLimiter, async (req, res) => {
    const baseUrl = `${protocol}://${req.get("host")}`;
    const fileUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}`;
    const autoDownloadUrl = `${baseUrl}/files/${encodeURIComponent(publicFileName)}/download`;
+   let thumbnail = mediaMetadata.thumbnail || null;
+
+   if (thumbnail && thumbnail.startsWith("//")) {
+     thumbnail = `https:${thumbnail}`;
+   }
+
+   if (!thumbnail) {
+     thumbnail = `https://via.placeholder.com/300x400?text=${platform}`;
+   }
 
    activeDownloads--;
    return res.json({
@@ -327,7 +336,7 @@ app.post("/download", downloadLimiter, async (req, res) => {
      fileUrl: fileUrl,
      downloadUrl: autoDownloadUrl,
      format,
-     thumbnail: mediaMetadata.thumbnail || null,
+     thumbnail,
      duration: mediaMetadata.duration || null,
      fileName: publicFileName,
      fileSize: formatFileSize(stats.size),
